@@ -1,11 +1,13 @@
 # Copyright 2022 - 2022, Martijn Braam and the OpenAtem contributors
 # SPDX-License-Identifier: LGPL-3.0-only
+from __future__ import annotations
 import struct
 
 
 class Cube:
+    title: str
+    table: list[tuple[float, float, float]]
     def __init__(self):
-        self.title = None
         self.table = []
         self.keywords = {}
 

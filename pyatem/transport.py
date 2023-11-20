@@ -1,5 +1,7 @@
 # Copyright 2021 - 2022, Martijn Braam and the OpenAtem contributors
 # SPDX-License-Identifier: LGPL-3.0-only
+from __future__ import annotations
+from typing import cast, Union, List, Tuple, Callable, Iterator, Literal
 import select
 import socket
 import struct
@@ -26,6 +28,18 @@ class Packet:
     STRUCT_HEADER = struct.Struct('>HHH 2x HH')
     STRUCT_USB = struct.Struct('<I')
 
+    flags: int
+    length: int
+    session: int
+    sequence_number: int
+    acknowledgement_number: int
+    remote_sequence_number: int
+    data: bytes
+    debug: bool
+    original: bytes|None
+    label: str|None
+    # last_packet_time: ?
+
     def __init__(self):
         self.flags = 0
         self.length = 0
@@ -33,14 +47,14 @@ class Packet:
         self.sequence_number = 0
         self.acknowledgement_number = 0
         self.remote_sequence_number = 0
-        self.data = None
+        self.data = b''
         self.debug = False
         self.original = None
         self.label = None
         self.last_packet_time = None
 
     @classmethod
-    def from_bytes(cls, packet):
+    def from_bytes(cls, packet: bytes):
         res = cls()
         res.original = packet
         fields = cls.STRUCT_HEADER.unpack_from(packet)
@@ -59,7 +73,7 @@ class Packet:
         res.data = packet[12:]
         return res
 
-    def to_bytes(self):
+    def to_bytes(self) -> bytes:
         header_len = 12
         data_len = len(self.data) if self.data is not None else 0
         packet_len = header_len + data_len
@@ -75,7 +89,7 @@ class Packet:
 
         return result
 
-    def to_usb(self):
+    def to_usb(self) -> bytes:
         data_len = len(self.data) if self.data is not None else 0
         result = self.STRUCT_USB.pack(data_len)
         if self.data:
@@ -104,7 +118,7 @@ class Packet:
             label = ' ' + self.label
         return '<Packet flags={} data={} sequence={}{}{}>'.format(flags, data_len, self.sequence_number, extra, label)
 
-    def get_flags(self):
+    def get_flags(self) -> list[str|int]:
         flags = [hex(self.flags), len(self.data)]
         if self.flags & 0x01:
             flags.append('AckRequest')
@@ -120,6 +134,12 @@ class Packet:
 
 
 class BaseProtocol:
+    send_queue: collections.deque[Packet]
+    queue_enabled: bool
+    queue_callback: Callable|None
+    mark_next_connected: bool
+    batch_size: int
+    batch_delay: float
     def __init__(self):
         self.send_queue = collections.deque(maxlen=1024)
         self.queue_enabled = False
@@ -128,13 +148,13 @@ class BaseProtocol:
         self.batch_size = 1
         self.batch_delay = 0
 
-    def _send_packet(self, packet):
+    def _send_packet(self, packet: Packet):
         raise NotImplementedError()
 
-    def queue_packet(self, packet):
+    def queue_packet(self, packet: Packet):
         self.send_queue.append(packet)
 
-    def queue_trigger(self):
+    def queue_trigger(self) -> bool:
         if len(self.send_queue) > 0:
             self.queue_enabled = True
             for i in range(0, min(len(self.send_queue), self.batch_size)):
@@ -148,7 +168,7 @@ class BaseProtocol:
             return True
         return False
 
-    def get_link_quality(self):
+    def get_link_quality(self) -> float:
         return 100
 
 
@@ -164,7 +184,27 @@ class UdpProtocol(BaseProtocol):
     FLAG_REQUEST_RETRANSMISSION = 8
     FLAG_ACK = 16
 
-    def __init__(self, ip, port=9910):
+    ip: str
+    port: int
+    sock: socket.socket
+    thread: threading.Thread
+    local_sequence_number: int
+    local_ack_number: int
+    remote_sequence_number: int
+    remote_ack_numbe: int
+    state: int
+    session_id: int|None
+    enable_ack: bool
+    had_traffic: bool
+    received_packets: collections.deque[int]
+    retransmission_buffer: dict[int, Packet]
+    thread_queue: SocketQueue[Packet]
+    thread_recv_queue: Queue[Packet|None|Literal[True]]
+    log: logging.Logger
+    packet_sucess: int
+    packet_errors: int
+
+    def __init__(self, ip: str, port: int = 9910):
         super().__init__()
         self.ip = ip
         self.port = port
@@ -204,10 +244,12 @@ class UdpProtocol(BaseProtocol):
             readable, _, _ = select.select([self.sock, self.thread_queue], [], [])
             for queue in readable:
                 if queue is self.sock:
+                    queue = cast(socket.socket, queue)
                     packet = self._receive_packet_low()
                     if packet is not None:
                         self.thread_recv_queue.put(packet)
                 elif queue is self.thread_queue:
+                    queue = cast(SocketQueue[Packet], queue)
                     try:
                         self._send_packet_low(queue.get())
                     except OSError as e:
@@ -219,14 +261,15 @@ class UdpProtocol(BaseProtocol):
                     self.thread_recv_queue.put(None)
                     RuntimeError("Unexpected result from select()")
 
-    def get_link_quality(self):
+    def get_link_quality(self) -> float:
         return 100 - (self.packet_errors / self.packet_sucess * 100)
 
-    def _send_packet(self, packet):
+    def _send_packet(self, packet: Packet):
         self.thread_queue.put(packet)
         self.packet_sucess += 1
 
-    def _send_packet_low(self, packet):
+    def _send_packet_low(self, packet: Packet):
+        assert self.session_id is not None
         packet.session = self.session_id
         if not packet.flags & UdpProtocol.FLAG_ACK:
             if self.local_sequence_number == -1:
@@ -246,10 +289,10 @@ class UdpProtocol(BaseProtocol):
             # Clear temporary session id, use the session id received in the first packet from the remote
             self.session_id = None
 
-    def _receive_packet(self):
+    def _receive_packet(self) -> Packet|None|Literal[True]:
         return self.thread_recv_queue.get()
 
-    def _receive_packet_low(self):
+    def _receive_packet_low(self) -> Packet|None|Literal[True]:
         try:
             data, address = self.sock.recvfrom(2048)
         except socket.timeout:
@@ -300,7 +343,7 @@ class UdpProtocol(BaseProtocol):
 
         return packet
 
-    def _handshake(self, packet):
+    def _handshake(self, packet: Packet):
         if not packet.flags & UdpProtocol.FLAG_SYN:
             return
 
@@ -338,16 +381,17 @@ class UdpProtocol(BaseProtocol):
         # Create first syn packet
         syn = Packet()
         syn.flags = UdpProtocol.FLAG_SYN
-        syn.data = [
+        data = bytearray([
             0x01, 0x00,
             0x00, 0x00,
             0x00, 0x00,
             0x00, 0x00,
-        ]
+        ])
+        syn.data = bytes(data)
         self._send_packet(syn)
         self.state = UdpProtocol.STATE_SYN_SENT
 
-    def receive_packet(self):
+    def receive_packet(self) -> Packet|ConnectionReady|TransferQueueFlushed|None:
         while True:
             packet = self._receive_packet()
 
@@ -399,7 +443,7 @@ class UdpProtocol(BaseProtocol):
                     # Data packet for the upper layer
                     return packet
 
-    def send_packet(self, packet):
+    def send_packet(self, packet: Packet):
         self._send_packet(packet)
 
 
@@ -411,6 +455,10 @@ class UsbProtocol(BaseProtocol):
         0xbe55: "Atem Mini Pro",
         0xbe7c: "Atem Mini Extreme",
     }
+    port: None|str
+    queue: Queue[bytes]
+    log: logging.Logger
+    handle: usb.core.Device
 
     def __init__(self, port=None):
         super().__init__()
@@ -420,18 +468,20 @@ class UsbProtocol(BaseProtocol):
 
         self.log = logging.getLogger('USBTransport')
 
-        self.handle = UsbProtocol.find_device()
+        handle = UsbProtocol.find_device()
+        assert handle is not None
+        self.handle = handle
         self._detach_kernel()
         self.handle.set_configuration()
 
     @classmethod
-    def device_exists(cls):
+    def device_exists(cls) -> bool:
         return cls.find_device() is not None
 
     @classmethod
-    def find_device(cls):
+    def find_device(cls) -> usb.core.Device|None:
         for prod in UsbProtocol.PRODUCTS.keys():
-            device = usb.core.find(idVendor=0x1edb, idProduct=prod)
+            device = cast(Union[usb.core.Device, None], usb.core.find(idVendor=0x1edb, idProduct=prod))
             if device is not None:
                 return device
         return None
@@ -439,7 +489,7 @@ class UsbProtocol(BaseProtocol):
     def _detach_kernel(self):
         try:
             for config in self.handle:
-                for i in range(config.bNumInterfaces):
+                for i in range(config.bNumInterfaces):  # type: ignore
                     if self.handle.is_kernel_driver_active(i):
                         try:
                             self.handle.detach_kernel_driver(i)
@@ -451,11 +501,11 @@ class UsbProtocol(BaseProtocol):
                 raise PermissionError(e)
 
 
-    def _send_packet(self, packet):
+    def _send_packet(self, packet: Packet):
         raw = packet.to_usb()
         self.queue.put(raw)
 
-    def _receive_packet(self):
+    def _receive_packet(self) -> Packet|TransferQueueFlushed|None:
         try:
             # Lower the timeout when doing an bulk upload to not wait a second between packets
             t = 1 if self.queue_enabled else 1100
@@ -488,7 +538,7 @@ class UsbProtocol(BaseProtocol):
     def connect(self):
         self.handle.ctrl_transfer(0x21, 0, 0x0000, 2, [])
 
-    def receive_packet(self):
+    def receive_packet(self) -> Packet|ConnectionReady|TransferQueueFlushed:
         while True:
 
             try:
@@ -506,7 +556,7 @@ class UsbProtocol(BaseProtocol):
             if packet is not None:
                 return packet
 
-    def send_packet(self, packet):
+    def send_packet(self, packet: Packet):
         self._send_packet(packet)
 
 
@@ -518,7 +568,20 @@ class TcpProtocol(BaseProtocol):
     STRUCT_HEADER = struct.Struct('!H')
     STRUCT_FIELD = struct.Struct('!H2x 4s')
 
-    def __init__(self, url=None, host=None, port=None, username=None, password=None, device=None):
+    device: str|None
+    sock: socket.socket
+    state: int
+    log: logging.Logger
+
+    def __init__(
+        self,
+        url: str|None = None,
+        host: str|None = None,
+        port: int|None = None,
+        username: str|None = None,
+        password: str|None = None,
+        device: str|None = None
+    ):
         super().__init__()
         if url is not None:
             part = urlparse(url)
@@ -533,16 +596,16 @@ class TcpProtocol(BaseProtocol):
         self.password = password
         self.device = device
 
-        self.sock = None
+        # self.sock = None
         self.state = TcpProtocol.STATE_INIT
 
         self.log = logging.getLogger('TcpTransport')
 
-    def _send_packet(self, data):
+    def _send_packet(self, data: bytes):
         header = self.STRUCT_HEADER.pack(len(data))
         self.sock.sendall(header + data)
 
-    def _receive_packet(self):
+    def _receive_packet(self) -> Packet|None:
         try:
             header = self.sock.recv(2)
             datalength, = self.STRUCT_HEADER.unpack(header)
@@ -562,17 +625,19 @@ class TcpProtocol(BaseProtocol):
         packet.data = data
         return packet
 
-    def decode_packet(self, data):
+    def decode_packet(self, data: bytes) -> Iterator[tuple[bytes, bytes]]:
         offset = 0
         if len(data) < 8:
             raise ValueError("Packet too short")
         while offset < len(data):
+            datalen: int
+            cmd: bytes
             datalen, cmd = self.STRUCT_FIELD.unpack_from(data, offset)
             raw = data[offset + 8:offset + datalen]
             yield (cmd, raw)
             offset += datalen
 
-    def list_to_packets(self, data):
+    def list_to_packets(self, data: list[tuple[bytes, bytes]]) -> bytes:
         result = b''
         for key, value in data:
             result += self.STRUCT_FIELD.pack(len(value) + 8, key)
@@ -595,11 +660,12 @@ class TcpProtocol(BaseProtocol):
         ]))
 
     def connect_device(self):
+        assert self.device is not None
         self._send_packet(self.list_to_packets([
             (b'*DEV', self.device.encode()),
         ]))
 
-    def receive_packet(self):
+    def receive_packet(self) -> Packet:
         while True:
             packet = self._receive_packet()
             if packet is None:
@@ -616,10 +682,10 @@ class TcpProtocol(BaseProtocol):
                 if packet is not None:
                     return packet
 
-    def send_packet(self, packet):
+    def send_packet(self, packet: Packet):
         self._send_packet(packet.data)
 
-    def upload(self, task):
+    def upload(self, task: TransferTask):
         if not isinstance(task, TransferTask):
             raise ValueError()
         for packet in task.to_tcp():

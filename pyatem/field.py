@@ -10,10 +10,12 @@ from pyatem.hexdump import hexdump
 
 
 class FieldBase:
-    def _get_string(self, raw):
+    raw: bytes
+    CODE: str
+    def _get_string(self, raw: bytes) -> str:
         return raw.split(b'\x00')[0].decode()
 
-    def make_packet(self):
+    def make_packet(self) -> bytes:
         header = struct.pack('!H2x 4s', len(self.raw) + 8, self.__class__.CODE.encode())
         return header + self.raw
 
@@ -2711,6 +2713,9 @@ class FileTransferDataField(FieldBase):
     """
 
     CODE = "FTDa"
+    transfer: int
+    size: int
+    data: bytes
 
     def __init__(self, raw):
         self.raw = raw
@@ -2747,6 +2752,8 @@ class FileTransferErrorField(FieldBase):
     """
 
     CODE = "FTDE"
+    transfer: int
+    status: int
 
     def __init__(self, raw):
         self.raw = raw
@@ -2783,6 +2790,9 @@ class FileTransferDataCompleteField(FieldBase):
     """
 
     CODE = "FTDC"
+    transfer: int
+    u1: int
+    u2: int
 
     def __init__(self, raw):
         self.raw = raw
@@ -2814,6 +2824,9 @@ class FileTransferContinueDataField(FieldBase):
     """
 
     CODE = "FTCD"
+    transfer: int
+    size: int
+    count: int
 
     def __init__(self, raw):
         self.raw = raw
@@ -3466,6 +3479,10 @@ class TransferCompleteField(FieldBase):
     """
 
     CODE = "*XFC"
+
+    store: int
+    slot: int
+    upload: bool
 
     def __init__(self, raw):
         self.raw = raw

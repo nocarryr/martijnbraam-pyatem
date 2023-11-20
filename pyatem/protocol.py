@@ -1,5 +1,7 @@
 # Copyright 2021 - 2022, Martijn Braam and the OpenAtem contributors
 # SPDX-License-Identifier: LGPL-3.0-only
+from __future__ import annotations
+from typing import Callable, Iterable, cast, TYPE_CHECKING
 import logging
 import struct
 
@@ -7,6 +9,8 @@ from pyatem.transfer import TransferTask, TransferQueueFlushed
 from pyatem.transport import UdpProtocol, Packet, UsbProtocol, TcpProtocol, ConnectionReady
 from pyatem.command import LockCommand, TransferDownloadRequestCommand, TransferAckCommand, \
     TransferUploadRequestCommand, TransferDataCommand, TransferFileDataCommand, PartialLockCommand, TimeRequestCommand
+if TYPE_CHECKING:
+    from pyatem.command import Command
 from pyatem.media import rle_decode
 import pyatem.field as fieldmodule
 
@@ -171,6 +175,24 @@ class AtemProtocol:
         'multiviewer-safe-area': struct.Struct('>BB'),
         'camera-control-data-packet': struct.Struct('>BBB'),
     }
+    transport: TcpProtocol|UdpProtocol|UsbProtocol
+    log: logging.Logger
+    # mixerstate: dict
+    callbacks: dict[str, dict[int, Callable]]
+    inputs: dict[str, int]
+    callback_idx: int
+    connected: bool
+    locks: dict[int, bool]
+    # mode: ?
+    transfer_queue: dict[int, list[TransferTask]]
+    transfer_id: int
+    transfer_buffer: bytes
+    # transfer_buffer2: list[?]
+    transfer: TransferTask|None
+    transfer_requested: bool
+    transfer_packets: int
+    transfer_budget: fieldmodule.FileTransferContinueDataField|None
+
 
     def __init__(self, ip=None, port=9910, usb=None):
         if ip is None and usb is None:
@@ -200,10 +222,12 @@ class AtemProtocol:
         self.transfer = None
         self.transfer_requested = False
         self.transfer_packets = 0
-        self.transfer_budget = []
+
+        # FIXME: why are we assigning a list here?
+        self.transfer_budget = None#[]
 
     @classmethod
-    def usb_exists(cls):
+    def usb_exists(cls) -> bool:
         return UsbProtocol.device_exists()
 
     def connect(self):
@@ -238,29 +262,32 @@ class AtemProtocol:
             self.mixerstate = {}
             self.connected = False
 
-    def on(self, event, callback):
+    def on(self, event: str, callback) -> int:
         if event not in self.callbacks:
-            self.callbacks[event] = {}
+            d: dict[int, Callable] = {}
+            self.callbacks[event] = d
         self.callbacks[event][self.callback_idx] = callback
         self.callback_idx += 1
         return self.callback_idx - 1
 
-    def off(self, event, callback_id):
+    def off(self, event: str, callback_id: int):
         if event not in self.callbacks:
             return
         del self.callbacks[event][callback_id]
 
-    def get_link_quality(self):
+    def get_link_quality(self) -> float:
         return self.transport.get_link_quality()
 
-    def _raise(self, event, *args, **kwargs):
+    def _raise(self, event: str, *args, **kwargs):
         if event in self.callbacks:
             for cbidx in self.callbacks[event]:
                 self.callbacks[event][cbidx](*args, **kwargs)
 
-    def decode_packet(self, data):
+    def decode_packet(self, data: bytes):
         offset = 0
         while offset < len(data):
+            datalen: int
+            cmd: bytes
             datalen, cmd = self.STRUCT_FIELD.unpack_from(data, offset)
 
             # A zero length header is not possible, this occurs when the transport layer has corruption, mark the
@@ -272,7 +299,7 @@ class AtemProtocol:
             yield (cmd, raw)
             offset += datalen
 
-    def save_field_data(self, fieldname, contents):
+    def save_field_data(self, fieldname: bytes, contents):
         raw = contents
         key = fieldname.decode()
         if key in self.FIELDNAME_PRETTY:
@@ -285,11 +312,13 @@ class AtemProtocol:
             return
 
         if key == 'lock-obtained':
+            contents = cast(fieldmodule.LockObtainedField, contents)
             self.log.info('Got lock for {}'.format(contents.store))
             self.locks[contents.store] = True
             self._transfer_trigger(contents.store)
             return
         elif key == 'lock-state':
+            contents = cast(fieldmodule.LockStateField, contents)
             if contents.state:
                 # Ignore lock aquired messages from other clients
                 return
@@ -299,6 +328,7 @@ class AtemProtocol:
             self.log.debug(contents)
             return
         elif key == 'file-transfer-continue-data':
+            contents = cast(fieldmodule.FileTransferContinueDataField, contents)
             self.transfer_budget = contents
             old = self.transfer_budget.size
             self.transfer_budget.size = self.transfer_budget.size // 8 * 8
@@ -307,6 +337,8 @@ class AtemProtocol:
             self._queue_chunks()
             return
         elif key == 'file-transfer-data':
+            contents = cast(fieldmodule.FileTransferDataField, contents)
+            assert self.transfer is not None
             if contents.transfer == self.transfer.tid:
                 self.transfer_packets += 1
                 self.transfer_buffer += contents.data
@@ -320,7 +352,9 @@ class AtemProtocol:
                 self.log.error('Got file transfer data for wrong transfer id')
             return
         elif key == 'file-transfer-error':
+            contents = cast(fieldmodule.FileTransferErrorField, contents)
             self.log.error(f"file-transfer-error: {str(contents)}")
+            assert self.transfer is not None
             self.transfer_requested = False
             if contents.status == 1:
                 # Status is try-again
@@ -331,6 +365,7 @@ class AtemProtocol:
                 self._transfer_trigger(self.transfer.store, retry=True)
             return
         elif key == 'file-transfer-data-complete':
+            contents = cast(fieldmodule.FileTransferDataCompleteField, contents)
             self.log.debug('Transfer complete')
             if self.transfer is None:
                 self.log.warning("Got FTDC without transfer active")
@@ -360,6 +395,7 @@ class AtemProtocol:
             self._transfer_trigger(self.transfer.store)
             return
         elif key == 'transfer-complete':
+            contents = fieldmodule.TransferCompleteField
             self.log.debug('Proxy transfer complete')
 
             # Remove current item from the transfer queue
@@ -372,6 +408,7 @@ class AtemProtocol:
                 # TODO: Implement proxy download
                 pass
             # Start next transfer in the queue
+            assert self.transfer is not None
             self._transfer_trigger(self.transfer.store)
             return
 
@@ -410,7 +447,7 @@ class AtemProtocol:
             result[path[0]] = self.make_unique_dict(content, path[1:])
         return result
 
-    def recursive_merge(self, d1, d2):
+    def recursive_merge(self, d1: dict, d2: dict) -> dict:
         '''update first dict with second recursively'''
         if not isinstance(d2, dict):
             return d2
@@ -420,8 +457,8 @@ class AtemProtocol:
         d1.update(d2)
         return d1
 
-    def send_commands(self, commands):
-        data = b''
+    def send_commands(self, commands: Iterable[Command]):
+        data: bytes = b''
         for command in commands:
             data += command.get_command()
 
@@ -430,30 +467,41 @@ class AtemProtocol:
 
         self.send_raw(data)
 
-    def send_raw(self, data):
+    def send_raw(self, data: bytes):
         packet = Packet()
         packet.flags = UdpProtocol.FLAG_RELIABLE
         packet.data = data
         self.transport.send_packet(packet)
 
-    def queue_callback(self, remaining, size):
+    def queue_callback(self, remaining: int, size: int):
         if not self.transfer:
             return
 
         self.transfer.send_done += size
+        assert self.transfer.send_length is not None
         fraction = self.transfer.send_done / self.transfer.send_length
         self._raise('upload-progress', self.transfer.store, self.transfer.slot, fraction * 100, self.transfer.send_done,
                     self.transfer.send_length)
 
-    def download(self, store, index):
+    def download(self, store: int, index: int):
         self.log.info("Queue download of {}:{}".format(store, index))
         if store not in self.transfer_queue:
             self.transfer_queue[store] = []
         self.transfer_queue[store].append(TransferTask(store, index))
         self._transfer_trigger(store)
 
-    def upload(self, store, index, data, compress=True, compressed=False, name=None, description=None, size=None,
-               task=None):
+    def upload(
+        self,
+        store: int,
+        index: int,
+        data: bytes,
+        compress: bool = True,
+        compressed: bool = False,
+        name: str|None = None,
+        description: str|None = None,
+        size: int|None = None,
+        task: TransferTask|None = None
+    ):
         self.log.info("Queue upload of {}:{}".format(store, index))
         if store not in self.transfer_queue:
             self.transfer_queue[store] = []
@@ -515,10 +563,12 @@ class AtemProtocol:
                 used -= 16
             self.transfer.data = self.transfer.data[used:]
 
+            assert self.transfer_budget is not None
             self.transfer_budget.count -= 1
             if self.transfer_budget.count == 0:
                 self.log.debug('Transfer budget ran out')
                 self.transfer_budget = None
+                # FIXME: shouldn't there be a break here to avoid the assertion above?
 
             cmd = TransferDataCommand(self.transfer.tid, chunk)
             packet = Packet()
@@ -529,6 +579,7 @@ class AtemProtocol:
 
     def _queue_flushed(self):
         self.log.info('Queue flushed')
+        assert self.transfer is not None
         if len(self.transfer.data):
             self._queue_chunks()
             return
@@ -537,7 +588,7 @@ class AtemProtocol:
                                       name=self.transfer.name, description=self.transfer.description)
         self.send_commands([cmd])
 
-    def _transfer_trigger(self, store, retry=False):
+    def _transfer_trigger(self, store: int, retry=False):
         next = None
 
         self.log.info(f'transfer trigger for store {store} (retry={retry})')

@@ -1,15 +1,15 @@
 # Copyright 2021 - 2022, Martijn Braam and the OpenAtem contributors
 # SPDX-License-Identifier: LGPL-3.0-only
+from __future__ import annotations
 import colorsys
 import datetime
 import struct
 
 
 class Command:
-    def get_command(self):
-        pass
+    def get_command(self) -> bytes: ...
 
-    def _make_command(self, name, data):
+    def _make_command(self, name: str, data: bytes) -> bytes:
         header = struct.pack('>H 2x 4s', len(data) + 8, name.encode())
         return header + data
 
@@ -2054,6 +2054,7 @@ class KeyerKeyframeRunCommand(Command):
 
     """
 
+    run_to: str|None
     def __init__(self, index, keyer, run_to=None, set_infinite=None):
         """
         :param index: M/E index
@@ -2072,6 +2073,7 @@ class KeyerKeyframeRunCommand(Command):
             'Full': 3,
             'Infinite': 4,
         }
+        assert self.run_to is not None
         run_to = run_to_lut[self.run_to]
         set_infinite = self.set_infinite or 0
 
